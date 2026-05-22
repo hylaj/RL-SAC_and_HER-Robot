@@ -127,11 +127,6 @@ class SAC:
         self.n_updates = n_updates
         self.batch_size = batch_size
         self.target_entropy = target_entropy
-        # Entropy coefficient / Entropy temperature
-        # Inverse of the reward scale
-        self.alpha = alpha
-        # TODO: fill this in
-        # Additional properties for automatic alpha adjustment...
 
         # Create actor-critic module and target networks
         self.policy = policy
@@ -176,46 +171,40 @@ class SAC:
         # Use the same device for alpha as for the policy
         alpha_device = next(self.policy.parameters()).device
 
-        # The entropy coefficient or entropy can be learned automatically
-        # see Automating Entropy Adjustment for Maximum Entropy RL section
+        # The entropy coefficient or entropy can be learned automatically.
+        # See "Automating Entropy Adjustment for Maximum Entropy RL" section
         # of https://arxiv.org/abs/1812.05905
-
-        #optymalizujemy log(alpha) zamiast alpha, bo jest to bardziej stabilne
-        if isinstance(self.alpha, str) and self.alpha.startswith("auto"):
-            # Default initial value of alpha when learned
+        #
+        # We optimise log(alpha) rather than alpha directly; this keeps alpha
+        # strictly positive throughout training and leads to a smoother
+        # loss landscape.
+        if isinstance(alpha, str) and alpha.startswith("auto"):
+            # Parse an optional explicit initial value, e.g. "auto_0.1"
             init_value = 1.0
-            if "_" in self.alpha:
-                init_value = float(self.alpha.split("_")[1])
-                assert (
-                    init_value > 0.0
-                ), "The initial value of alpha must be greater than 0"
+            if "_" in alpha:
+                init_value = float(alpha.split("_")[1])
+                assert init_value > 0.0, "The initial value of alpha must be greater than 0"
 
-            # Consider: optimizing the log of the entropy coeff which is slightly different from the paper
-            # as discussed in https://github.com/rail-berkeley/softlearning/issues/37
-
-            # TODO: fill this in
-            # self.alpha = ...
-            # self.alpha_optimizer = ...
-
+            # log_alpha is the learnable parameter; alpha is its exponent.
             self.log_alpha = torch.tensor(
                 np.log(init_value), dtype=torch.float32,
                 requires_grad=True, device=alpha_device
             )
+            # Expose a plain float so the rest of the code can use self.alpha
+            # without worrying about autograd.
             self.alpha = float(self.log_alpha.exp().item())
-            self.alpha_optimizer = Adam([self.log_alpha], lr=3e-4)
+            self.alpha_optimizer = Adam([self.log_alpha], lr=lr)
         else:
-            # Force conversion to float
-            # this will throw an error if a malformed string (different from 'auto') is passed
-            # self.alpha = torch.tensor(
-            #     float(self.alpha), dtype=torch.float32, device=alpha_device
-            # )
-
+            # Fixed alpha: store as a plain float for consistency.
             self.alpha = float(alpha)
+            # Sentinel so update() knows not to optimise alpha.
             self.log_alpha = None
             self.alpha_optimizer = None
 
+    # ------------------------------------------------------------------
+    # Loss functions
+    # ------------------------------------------------------------------
 
-    # Set up function for computing SAC Q-losses
     def compute_loss_q(self, data):
         o, a, r, o2, ter, tru = (
             data["observation"],
@@ -252,7 +241,6 @@ class SAC:
 
         return loss_q, q_info
 
-    # Set up function for computing SAC pi loss
     def compute_loss_pi(self, data):
         o = data["observation"]
         pi, logp_pi = self.policy.pi(o)
@@ -268,18 +256,34 @@ class SAC:
 
         return loss_pi, logp_pi, pi_info
 
-    def compute_loss_alpha(self, logp_pi):
-        # Important: detach the variable from the graph
-        # so we don't change it with other losses
-        # see https://github.com/rail-berkeley/softlearning/issues/60
-        # TODO: fill this in
+    def compute_loss_alpha(self, logp_pi: torch.Tensor):
+        """
+        Compute the loss for the entropy coefficient (alpha).
+
+        The objective is to find alpha that satisfies the constraint
+            E[entropy] >= target_entropy
+        which is equivalent to minimising
+            L(alpha) = E[-alpha * (log pi(a|s) + target_entropy)]
+                     = E[-exp(log_alpha) * (logp_pi + target_entropy)]
+
+        We differentiate through log_alpha (not alpha) for numerical
+        stability (alpha stays strictly positive).
+
+        Reference: Haarnoja et al. (2019), eq. (17)
+        """
+        # Detach logp_pi so that gradients only flow into log_alpha, not
+        # back into the actor network.
         alpha_loss = -(
             self.log_alpha.exp() * (logp_pi.detach() + self.target_entropy)
         ).mean()
 
+        # Return the current alpha value (as a scalar tensor) for logging.
         alpha = self.log_alpha.exp().detach()
         return alpha_loss, alpha
-        # Remember to use target_entropy
+
+    # ------------------------------------------------------------------
+    # Update step
+    # ------------------------------------------------------------------
 
     def update(self, data) -> dict[str, float]:
         self.policy.train()
@@ -289,7 +293,7 @@ class SAC:
         loss_q.backward()
         self.q_optimizer.step()
 
-        # Freeze Q-networks so you don"t waste computational effort
+        # Freeze Q-networks so you don't waste computational effort
         # computing gradients for them during the policy learning step.
         for p in self.q_params:
             p.requires_grad = False
@@ -314,20 +318,16 @@ class SAC:
                 p_targ.data.mul_(self.polyak)
                 p_targ.data.add_((1 - self.polyak) * p.data)
 
-        # Optimize entropy coefficient, also called
-        # entropy temperature or alpha in the paper
+        # Optimise the entropy coefficient alpha when in automatic mode.
         if self.alpha_optimizer is not None:
             alpha_loss, alpha = self.compute_loss_alpha(logp_pi)
-
-            # TODO: fill this in
-            # Update alpha...
-
             self.alpha_optimizer.zero_grad()
             alpha_loss.backward()
             self.alpha_optimizer.step()
+            # Keep self.alpha in sync with the learned log_alpha so that
+            # compute_loss_q and compute_loss_pi always see the current value.
             self.alpha = float(self.log_alpha.exp().item())
         else:
-            # alpha_loss = np.array(0)
             alpha_loss = torch.tensor(0.0)
 
         return {
@@ -335,6 +335,10 @@ class SAC:
             "pi": loss_pi.item(),
             "alpha": alpha_loss.item(),
         }
+
+    # ------------------------------------------------------------------
+    # Testing
+    # ------------------------------------------------------------------
 
     def test(
         self,
@@ -410,6 +414,9 @@ class SAC:
 
         return results
 
+    # ------------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------------
 
     def train(self, n_steps, log_interval=1000, callbacks=[]):
         # Prepare for interaction with environment
@@ -478,6 +485,9 @@ class SAC:
 
         return test_ep_return
 
+    # ------------------------------------------------------------------
+    # Serialisation
+    # ------------------------------------------------------------------
 
     def save(self, path: str):
         checkpoint = {
@@ -485,8 +495,6 @@ class SAC:
             "alpha": self.alpha,
             "pi_optimizer_state_dict": self.pi_optimizer.state_dict(),
             "q_optimizer_state_dict": self.q_optimizer.state_dict(),
-            # TODO: fill this in
-            # "alpha_optimizer_state_dict": ...,
         }
         if self.alpha_optimizer is not None:
             checkpoint["log_alpha"] = self.log_alpha.item()
@@ -499,11 +507,6 @@ class SAC:
         self.pi_optimizer.load_state_dict(checkpoint["pi_optimizer_state_dict"])
         self.q_optimizer.load_state_dict(checkpoint["q_optimizer_state_dict"])
         self.alpha = checkpoint["alpha"]
-        # TODO: fill this in
-        # self.alpha_optimizer = ...
         if self.alpha_optimizer is not None and "alpha_optimizer_state_dict" in checkpoint:
             self.log_alpha.data.fill_(checkpoint["log_alpha"])
             self.alpha_optimizer.load_state_dict(checkpoint["alpha_optimizer_state_dict"])
-
-
-

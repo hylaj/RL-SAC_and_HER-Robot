@@ -154,11 +154,17 @@ class HerReplayBuffer(DictReplayBuffer):
         self.env = env
         self.n_sampled_goal = n_sampled_goal
         self.selection_strategy = goal_selection_strategy
+        
         # TODO: fill this in
         # You can put additional attributes here if needed.
         # Also: There is a number of methods in the base class that could be useful to override.
 
-   
+        self.episode_indices = []
+
+    def start_episode(self):
+        self.episode_indices = []
+
+
     def store(
         self,
         observation: dict[str, torch.Tensor],
@@ -173,6 +179,8 @@ class HerReplayBuffer(DictReplayBuffer):
         # Just a suggestion: it may make sense to modify this method
         
         # Store the transition
+        
+        idx = self._ptr
         super().store(
             observation=observation,
             action=action,
@@ -182,9 +190,87 @@ class HerReplayBuffer(DictReplayBuffer):
             truncated=truncated,
             info=info,
         )
+        self.episode_indices.append(idx) # lista indeksów przejść aktualnego epizodu
 
         # TODO: fill this in
         # Or maybe here?
+
+
+    def end_episode(self):
+        # w tym nowym algorytmie to każda akcja z epizodu dostaje nowy goal, a w zasadzie 4 nowe goale (n_smapled_goal)
+
+
+
+        # w zależności czy strategia to future czy final, wybieramy indeksy odpowiednich kandydatów do losowania. Zabezpieczenie przed brakiem kandydatów. 
+
+        episode_indices = self.episode_indices
+        n = len(episode_indices)
+
+        if n == 0:
+            return
+        
+        for i, idx in enumerate(episode_indices):
+            if self.selection_strategy == "final":
+                candidates = episode_indices[-1:]  
+            elif self.selection_strategy == "future":
+                candidates = episode_indices[i+1:]
+            else:
+                raise ValueError(f"Unknown goal selection strategy: {self.selection_strategy}")
+            
+            if not candidates:
+                continue
+
+        # Samplujemy n_sampled_goal razy (lub mniej) - czyli losujemy spośród kandydatów
+
+            n_goals = min(self.n_sampled_goal, len(candidates))
+            sampled_indices = np.random.choice(candidates, size=n_goals, replace=False)
+
+            # pobieramy obserwacje, next_obs, akcje i wszystkie inne dane dla tych indeksów. 
+
+            obs = {k: self.observations[k][idx].cpu().numpy() for k in self.observations}
+
+            next_obs = {k: self.next_observations[k][idx].cpu().numpy() for k in self.next_observations}
+
+            action = self.actions[idx].cpu().numpy()
+            terminated = self.terminations[idx].item()  # czy castowac na bool?
+            truncated = self.truncations[idx].item()
+            info = self.infos[idx]        
+
+
+            # Dla każdego nowego goal tworzymy jedno nowe przejście: Pobieramy osiągnięty goal z obserwacji z bufora pod tym indeksem goalu. 
+
+            for sampled_idx in sampled_indices:
+                new_goal = self.observations["achieved_goal"][sampled_idx].cpu().numpy()
+
+                # Kopiujemy te obserwacje i next obs  i zastępujemy w nich desired goal tym achieved goal.
+                new_obs = {k: v.copy() for k, v in obs.items()}
+                new_next_obs = {k: v.copy() for k, v in next_obs.items()}
+
+                new_obs["desired_goal"] = new_goal
+                new_next_obs["desired_goal"] = new_goal
+
+                # liczymy nową reward (specjalna funkcja env.compute_reward)
+
+                new_reward = self.env.unwrapped.compute_reward(new_next_obs["achieved_goal"], new_goal, info)
+
+                # sprawszmy czy jest termindated (jest jesli nagorda nowa jest rowna zero) i truncated nie jest (czylu false), bo w her nie ma limitu czasu
+
+                new_terminated = (new_reward == 0.0)
+                new_truncated = False
+
+                # zapisujemy za pomoca funkcji store do buffera
+
+                DictReplayBuffer.store(
+                    self,
+                    observation=new_obs,
+                    action=action,
+                    reward=new_reward,
+                    next_observation=new_next_obs,
+                    terminated=new_terminated,
+                    truncated=new_truncated,
+                    info=info,
+                )
+
 
 
 

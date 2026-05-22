@@ -6,6 +6,8 @@
 # Also give it a try on push and pick and place tasks: PandaPush-v3, PandaPickAndPlace-v3, FetchPush-v3, FetchPickAndPlace-v3
 
 import argparse
+from datetime import datetime
+import os
 
 import gymnasium as gym
 # Uncomment the following line to use gymnasium_robotics environments
@@ -56,7 +58,13 @@ def main(env_id: str) -> None:
         goal_selection_strategy="future",
         device=device,
     )
-    logger = TensorboardLogger()
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_name = f"{env_id}_{timestamp}"
+    log_path = os.path.join("C:/Users/jolah/AGH/logs", run_name)
+
+    logger = TensorboardLogger(save_dir=log_path)
+
     logger.open()
 
     algo = SAC(
@@ -65,23 +73,27 @@ def main(env_id: str) -> None:
         buffer=buffer,
         update_every=1,
         update_after=1000,
-        batch_size=64,
-        # alpha="auto", # use automatic alpha adjustment (uncoment when implemented)
-        alpha=0.05, # use fixed alpha (comment out when implementing automatic alpha adjustment)
-        gamma=0.9,
+        batch_size=256, #64
+        alpha="auto", # use automatic alpha adjustment (uncoment when implemented)
+        # alpha=0.05, # use fixed alpha (comment out when implementing automatic alpha adjustment)
+        gamma= 0.95, #0.9,
         # polyak=0.95,
-        lr=1e-4,
+        lr=1e-3, #1e-4,
         logger=logger,
         max_episode_len=100,
         start_steps=1_000,
     )
-    algo.train(n_steps=100_000, log_interval=1000)
+    algo.train(n_steps=500_000, log_interval=1000)
+    algo.save("PandaPush_alfa_auto_future_sampled3_v2.pth")
     env.close()
     logger.close()
 
     policy.cpu()
     env = gym.make(env_id, render_mode="human")
-    test_rew, test_ep_len = algo.test(env, n_episodes=50, sleep=1 / 30)
+    # test_rew, test_ep_len = algo.test(env, n_episodes=50, sleep=1 / 30)
+    test_results = algo.test(env, n_episodes=50, sleep=1 / 30)
+    test_rew = test_results["mean_ep_ret"]
+    test_ep_len = test_results["mean_ep_len"]
     env.close()
     print(f"Test reward {test_rew}, Test episode length: {test_ep_len}")
 
@@ -89,7 +101,7 @@ def main(env_id: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--env", type=str, default="PandaReach-v3", help="Gym environment ID"
+        "--env", type=str, default="PandaPush-v3", help="Gym environment ID"
     )
 
     args = parser.parse_args()
